@@ -1,19 +1,19 @@
 # ============================================================
-# FEATURE SELECTION PIPELINE
+# FEATURE SELECTION PIPELINE — FULL FIXED CODE
 # 69 features → filtered set → ready for itertools loop
 # ============================================================
 
 import pandas as pd
 import numpy as np
 from statsmodels.tsa.stattools import adfuller, kpss, grangercausalitytests
-from statsmodels.stats.diagnostic import bds
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.feature_selection import mutual_info_regression
 from sklearn.preprocessing import StandardScaler
+import itertools
 import warnings
 warnings.filterwarnings('ignore')
 
-TARGET = 'Gross Credit Losses'
+TARGET       = 'Gross Credit Losses'
 DROP_COLUMNS = ['DATE', TARGET]
 ALL_FEATURES = [col for col in df.columns if col not in DROP_COLUMNS]
 
@@ -21,41 +21,83 @@ ALL_FEATURES = [col for col in df.columns if col not in DROP_COLUMNS]
 # STEP 1: STATIONARITY CHECK — Transform non-stationary features
 # ============================================================
 
-def check_stationarity(series, name):
+def check_stationarity(series, name=""):
+    """
+    Returns True if series is stationary using both ADF and KPSS.
+    Stationary = ADF rejects unit root AND KPSS fails to reject stationarity.
+    """
     try:
-        adf_p = adfuller(series.dropna())[1]
-        kpss_p = kpss(series.dropna(), regression='c')[1]
-        # Stationary = ADF rejects unit root + KPSS fails to reject
-        is_stationary = (adf_p < 0.05) and (kpss_p > 0.05)
-        return is_stationary
+        s      = series.dropna()
+        if len(s) < 10:
+            return False
+        adf_p  = adfuller(s)[1]
+        kpss_p = kpss(s, regression='c', nlags='auto')[1]
+        return (adf_p < 0.05) and (kpss_p > 0.05)
     except:
         return False
+
+
+def make_stationary(series, col_name, max_diffs=2):
+    """
+    Differences series until stationary, up to max_diffs times.
+    Returns (transformed_series, n_diffs_applied).
+    """
+    s = series.copy()
+    for d in range(max_diffs + 1):
+        if check_stationarity(s.dropna(), col_name):
+            return s, d
+        if d < max_diffs:
+            s = s.diff()
+    # Still not stationary — return best effort (first diff)
+    print(f"  ⚠️  {col_name}: not stationary after {max_diffs} diffs — kept at d=1")
+    return series.diff(), 1
+
 
 print("=" * 60)
 print("STEP 1: STATIONARITY CHECK")
 print("=" * 60)
 
-df_stationary = df.copy()
+df_stationary  = df.copy()
 non_stationary = []
+diff_order     = {}
 
 for col in ALL_FEATURES:
-    is_stat = check_stationarity(df[col], col)
-    if not is_stat:
-        df_stationary[col] = df[col].diff()  # first difference
+    if check_stationarity(df[col].dropna(), col):
+        diff_order[col] = 0   # already stationary, no change
+    else:
+        transformed, n_diffs    = make_stationary(df[col], col)
+        df_stationary[col]      = transformed
+        diff_order[col]         = n_diffs
         non_stationary.append(col)
 
-# Also difference the target for testing purposes
-target_stat = df[TARGET].copy()
-if not check_stationarity(target_stat, TARGET):
-    target_stat = target_stat.diff()
+        # ✅ Verify it actually worked
+        is_now_stat = check_stationarity(transformed.dropna(), col)
+        status      = "✅" if is_now_stat else "⚠️  still non-stationary"
+        if n_diffs == 2:
+            print(f"  {status} {col} needed d={n_diffs}")
+
+# Target — differenced separately for testing only
+target_stat         = df[TARGET].copy()
+target_transformed, target_diffs = make_stationary(target_stat, TARGET)
+target_stat         = target_transformed
 
 # Drop NaN rows introduced by differencing
 df_stationary = df_stationary.dropna().reset_index(drop=True)
-target_stat = target_stat.dropna().reset_index(drop=True)
+target_stat   = target_stat.dropna().reset_index(drop=True)
 
-print(f"Non-stationary features differenced : {len(non_stationary)}")
-print(f"Stationary features (no change)     : {len(ALL_FEATURES) - len(non_stationary)}")
-print(f"Rows after differencing             : {len(df_stationary)}")
+# Align lengths
+min_len       = min(len(df_stationary), len(target_stat))
+df_stationary = df_stationary.iloc[:min_len].reset_index(drop=True)
+target_stat   = target_stat.iloc[:min_len].reset_index(drop=True)
+
+d0 = sum(1 for v in diff_order.values() if v == 0)
+d1 = sum(1 for v in diff_order.values() if v == 1)
+d2 = sum(1 for v in diff_order.values() if v == 2)
+
+print(f"Already stationary  (d=0) : {d0}")
+print(f"Stationary after 1 diff   : {d1}")
+print(f"Stationary after 2 diffs  : {d2}")
+print(f"Rows after differencing   : {len(df_stationary)}")
 
 
 # ============================================================
@@ -67,8 +109,8 @@ print("STEP 2: CORRELATION + MUTUAL INFORMATION SCREENING")
 print("=" * 60)
 
 LAGS        = [0, 1, 2, 3]
-CORR_THRESH = 0.25   # minimum |correlation| at any lag
-MI_THRESH   = 0.05   # minimum MI score at any lag
+CORR_THRESH = 0.25
+MI_THRESH   = 0.05
 
 screening_results = []
 
@@ -78,19 +120,22 @@ for col in ALL_FEATURES:
 
     for lag in LAGS:
         feature_lagged = df_stationary[col].shift(lag)
-        combined       = pd.concat([feature_lagged, target_stat], axis=1).dropna()
+        combined       = pd.concat(
+            [feature_lagged, target_stat], axis=1
+        ).dropna()
+        combined.columns = ['feature', 'target']
 
         if len(combined) < 10:
             continue
 
         # Correlation
-        corr = abs(combined.iloc[:, 0].corr(combined.iloc[:, 1]))
+        corr     = abs(combined['feature'].corr(combined['target']))
         max_corr = max(max_corr, corr if not np.isnan(corr) else 0)
 
         # Mutual Information
-        X = combined.iloc[:, 0].values.reshape(-1, 1)
-        y = combined.iloc[:, 1].values
-        mi = mutual_info_regression(X, y, random_state=42)[0]
+        X      = combined['feature'].values.reshape(-1, 1)
+        y      = combined['target'].values
+        mi     = mutual_info_regression(X, y, random_state=42)[0]
         max_mi = max(max_mi, mi)
 
     screening_results.append({
@@ -99,9 +144,9 @@ for col in ALL_FEATURES:
         'max_mi'  : round(max_mi,   4)
     })
 
-screening_df = pd.DataFrame(screening_results)
+screening_df   = pd.DataFrame(screening_results)
 
-# Filter: must pass EITHER correlation OR MI threshold
+# Keep if EITHER correlation OR MI passes threshold
 step2_features = screening_df[
     (screening_df['max_corr'] >= CORR_THRESH) |
     (screening_df['max_mi']   >= MI_THRESH)
@@ -109,8 +154,13 @@ step2_features = screening_df[
 
 print(f"Features before screening : {len(ALL_FEATURES)}")
 print(f"Features after screening  : {len(step2_features)}")
-print(f"\nTop 10 by correlation:")
-print(screening_df.sort_values('max_corr', ascending=False).head(10).to_string(index=False))
+print(f"\nTop 15 by correlation:")
+print(
+    screening_df
+    .sort_values('max_corr', ascending=False)
+    .head(15)
+    .to_string(index=False)
+)
 
 
 # ============================================================
@@ -127,33 +177,44 @@ def compute_vif(feature_df):
     scaler    = StandardScaler()
     scaled    = scaler.fit_transform(feature_df.fillna(0))
     scaled_df = pd.DataFrame(scaled, columns=feature_df.columns)
-    vif_data  = pd.DataFrame()
-    vif_data['feature'] = scaled_df.columns
-    vif_data['VIF']     = [
-        variance_inflation_factor(scaled_df.values, i)
-        for i in range(scaled_df.shape[1])
-    ]
-    return vif_data.sort_values('VIF', ascending=False)
+    vif_data  = pd.DataFrame({
+        'feature': scaled_df.columns,
+        'VIF'    : [
+            variance_inflation_factor(scaled_df.values, i)
+            for i in range(scaled_df.shape[1])
+        ]
+    })
+    return vif_data.sort_values('VIF', ascending=False).reset_index(drop=True)
 
-# Iteratively remove highest VIF feature until all < threshold
+
+# Iteratively remove highest VIF until all below threshold
 remaining_features = step2_features.copy()
 
 while True:
-    feat_df  = df_stationary[remaining_features].fillna(0)
-    vif_df   = compute_vif(feat_df)
-    max_vif  = vif_df['VIF'].max()
+    if len(remaining_features) <= 2:
+        break
+    feat_df = df_stationary[remaining_features].fillna(0)
+    vif_df  = compute_vif(feat_df)
+    max_vif = vif_df['VIF'].max()
 
-    if max_vif <= VIF_THRESH or len(remaining_features) <= 3:
+    if max_vif <= VIF_THRESH:
         break
 
-    # Remove feature with highest VIF
-    # (but prefer keeping higher MI score among ties)
+    # Among high-VIF features, drop the one with lowest MI score
     worst_feat = vif_df.iloc[0]['feature']
+
+    # Prefer keeping higher MI score — check MI from Step 2
+    mi_scores  = screening_df.set_index('feature')['max_mi']
+    top_vif    = vif_df[vif_df['VIF'] > VIF_THRESH]['feature'].tolist()
+    if top_vif:
+        worst_feat = min(top_vif, key=lambda f: mi_scores.get(f, 0))
+
     remaining_features.remove(worst_feat)
-    print(f"  Removed (VIF={max_vif:.1f}): {worst_feat}")
+    print(f"  Removed (VIF={max_vif:.1f}, low MI): {worst_feat}")
 
 step3_features = remaining_features
-print(f"\nFeatures after VIF check: {len(step3_features)}")
+print(f"\nFeatures after VIF check : {len(step3_features)}")
+print(f"Remaining features       : {step3_features}")
 
 
 # ============================================================
@@ -161,21 +222,51 @@ print(f"\nFeatures after VIF check: {len(step3_features)}")
 # ============================================================
 
 print("\n" + "=" * 60)
-print("STEP 4: NON-LINEARITY CHECK (BDS TEST)")
+print("STEP 4: NON-LINEARITY CHECK")
 print("=" * 60)
 
+def check_nonlinearity(series):
+    """
+    Proxy non-linearity test:
+    Fits linear AR(2), checks if squared fitted values
+    correlate with residuals → sign of non-linear structure.
+    """
+    from statsmodels.tsa.ar_model import AutoReg
+    from scipy import stats
+
+    s = series.dropna().values
+    try:
+        model      = AutoReg(s, lags=2).fit()
+        resid      = model.resid
+        fitted_sq  = model.fittedvalues ** 2
+        min_len    = min(len(resid), len(fitted_sq))
+        _, p       = stats.pearsonr(resid[-min_len:], fitted_sq[-min_len:])
+        return p < 0.05, round(p, 4)
+    except Exception as e:
+        print(f"  Non-linearity test failed: {e}")
+        return False, 1.0
+
+# Try BDS first, fall back to AR residual test
 try:
-    bds_stat, bds_p = bds(target_stat.values, distance=1.5)
-    is_nonlinear    = bds_p < 0.05
-    print(f"BDS Statistic : {bds_stat:.4f}")
-    print(f"BDS p-value   : {bds_p:.4f}")
-    print(f"Non-linear    : {is_nonlinear}")
-    causality_method = "transfer_entropy" if is_nonlinear else "granger"
-    print(f"→ Using       : {causality_method.upper()}")
-except Exception as e:
-    print(f"BDS test failed: {e} — defaulting to Granger")
-    causality_method = "granger"
-    is_nonlinear     = False
+    from statsmodels.tsa.stattools import bds
+    bds_stat, bds_p  = bds(target_stat.values, distance=1.5)
+    is_nonlinear     = bds_p < 0.05
+    print(f"BDS Statistic  : {bds_stat:.4f}")
+    print(f"BDS p-value    : {bds_p:.4f}")
+except ImportError:
+    try:
+        from statsmodels.stats.stattools import bds
+        bds_stat, bds_p = bds(target_stat.values, distance=1.5)
+        is_nonlinear    = bds_p < 0.05
+        print(f"BDS p-value    : {bds_p:.4f}")
+    except:
+        print("BDS unavailable — using AR residual proxy test")
+        is_nonlinear, bds_p = check_nonlinearity(target_stat)
+        print(f"Proxy p-value  : {bds_p:.4f}")
+
+causality_method = "transfer_entropy" if is_nonlinear else "granger"
+print(f"Non-linear     : {is_nonlinear}")
+print(f"→ Using        : {causality_method.upper()}")
 
 
 # ============================================================
@@ -186,9 +277,8 @@ print("\n" + "=" * 60)
 print(f"STEP 5: CAUSALITY TEST ({causality_method.upper()})")
 print("=" * 60)
 
-CAUSALITY_P_THRESH = 0.10   # slightly relaxed given small sample
-MAX_LAG            = 2      # conservative for 20 points
-
+CAUSALITY_P_THRESH = 0.10
+MAX_LAG            = 2
 causal_features    = []
 causality_results  = []
 
@@ -201,6 +291,7 @@ if causality_method == "granger":
             combined.columns = ['feature', 'target']
 
             if len(combined) < 15:
+                print(f"  Skipped {col}: insufficient rows ({len(combined)})")
                 continue
 
             test_result = grangercausalitytests(
@@ -209,7 +300,7 @@ if causality_method == "granger":
                 verbose=False
             )
 
-            # Get minimum p-value across lags
+            # Minimum p-value across all lags
             min_p = min([
                 test_result[lag][0]['ssr_ftest'][1]
                 for lag in range(1, MAX_LAG + 1)
@@ -228,22 +319,21 @@ if causality_method == "granger":
             print(f"  Skipped {col}: {e}")
 
 else:
-    # Transfer Entropy fallback (requires 'pyinform' or similar)
+    # Transfer Entropy fallback
     print("⚠️  Transfer Entropy requires: pip install pyinform")
     print("   Falling back to Granger as approximation...")
-    causal_features = step3_features  # keep all if TE unavailable
+    causal_features = step3_features
 
-causality_df = pd.DataFrame(causality_results) if causality_results else pd.DataFrame()
-
-if not causality_df.empty:
+if causality_results:
+    causality_df = pd.DataFrame(causality_results).sort_values('min_p')
     print(f"\nCausality results:")
-    print(causality_df.sort_values('min_p').to_string(index=False))
+    print(causality_df.to_string(index=False))
 
-print(f"\nFeatures passing causality test: {len(causal_features)}")
+print(f"\nFeatures passing causality : {len(causal_features)}")
 
 
 # ============================================================
-# FINAL: FILTERED FEATURE SET
+# FINAL SUMMARY
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -257,14 +347,15 @@ print(f"\nFINAL FILTERED FEATURES:")
 for i, f in enumerate(causal_features, 1):
     print(f"  {i:2d}. {f}")
 
+
 # ============================================================
 # READY FOR YOUR BRUTE FORCE LOOP
 # ============================================================
 
-ALL_FEATS = causal_features  # plug directly into your existing code
-
+ALL_FEATS            = causal_features
 feature_combinations = []
+
 for r in range(1, min(4, len(ALL_FEATS) + 1)):  # max 3 covariates
     feature_combinations.extend(itertools.combinations(ALL_FEATS, r))
 
-print(f"\nTotal combinations to test: {len(feature_combinations)}")
+print(f"\nTotal combinations to test : {len(feature_combinations)}")
