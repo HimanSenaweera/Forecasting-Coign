@@ -168,3 +168,35 @@ def full_grid_search(
     print(f"  Lags      : {best.get('lags')}")
 
     return out.head(top_k), best
+
+features = [
+    "90+ DQ Rate",
+    "Payment Rate",
+    "Finance Charges Rate",
+    "Expected Loss Roll Ave 3M",
+]
+
+top, best = full_grid_search(
+    base_df     = df_merged,
+    features    = features,
+    target_col  = TARGET_METRIC,
+    train_range = (first_input_date, last_input_date),
+    test_range  = (first_test_date,  last_test_date),
+
+    lags        = (0, 1, 2, 3),
+    target_lag  = 1,
+
+    p_range     = (0, 1, 2, 3),
+    d_range     = (0, 1),
+    q_range     = (0, 1, 2),
+
+    P_range     = (0,),   # expand to (0, 1) if you suspect seasonality
+    D_range     = (0,),
+    Q_range     = (0,),
+    m_range     = (0,),   # set to (12,) for monthly seasonality
+
+    trend_options = ("n", "c"),
+    top_k       = 20,
+)
+
+top[["mape", "aic", "bic", "order", "seasonal_order", "trend", "lags"]]
